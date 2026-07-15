@@ -3,7 +3,61 @@ import OpenAI from "openai";
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
 export const maxDuration = 300;
+export const runtime = "nodejs";
+
+const allowedAccessoryIds = [
+  "lightbar",
+  "airhorns",
+  "led-logo",
+  "sunvisor",
+] as const;
+
+type AccessoryId = (typeof allowedAccessoryIds)[number];
+
+const accessoryInstructions: Record<AccessoryId, string> = {
+  lightbar:
+    "Use the exact lightbar from its reference image and mount it centred on the roof above the windscreen.",
+  airhorns:
+    "Use the exact airhorns from their reference image and mount them professionally on the roof.",
+  "led-logo":
+    "Use the exact illuminated DAF logo from its reference image and integrate only this logo into the front grille.",
+  sunvisor:
+    "Use the exact sun visor from its reference image and mount it directly above the windscreen.",
+};
+
+function isAccessoryId(value: unknown): value is AccessoryId {
+  return (
+    typeof value === "string" &&
+    allowedAccessoryIds.includes(value as AccessoryId)
+  );
+}
+
+async function loadReferenceImage(
+  accessoryId: AccessoryId,
+  requestUrl: string
+): Promise<File> {
+  const referenceUrl = new URL(
+    `/accessories/${accessoryId}.png`,
+    requestUrl
+  );
+
+  const response = await fetch(referenceUrl);
+
+  if (!response.ok) {
+    throw new Error(
+      `Referentieafbeelding voor "${accessoryId}" kon niet worden geladen.`
+    );
+  }
+
+  const imageBlob = await response.blob();
+
+  return new File([imageBlob], `${accessoryId}.png`, {
+    type: imageBlob.type || "image/png",
+  });
+}
+
 export async function POST(request: Request) {
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -17,9 +71,7 @@ export async function POST(request: Request) {
 
     const image = formData.get("image");
     const accessoriesRaw = formData.get("accessories");
-const referenceImages = formData
-  .getAll("referenceImages")
-  .filter((item): item is File => item instanceof File);
+
     if (!(image instanceof File)) {
       return Response.json(
         { error: "Geen geldige truckfoto ontvangen." },
@@ -27,48 +79,62 @@ const referenceImages = formData
       );
     }
 
-    const accessories =
-      typeof accessoriesRaw === "string"
-        ? JSON.parse(accessoriesRaw)
-        : [];
+    if (typeof accessoriesRaw !== "string") {
+      return Response.json(
+        { error: "Geen geldige accessoireselectie ontvangen." },
+        { status: 400 }
+      );
+    }
 
-    const accessoryInstructions: Record<string, string> = {
-  lightbar:
-    "Use the exact lightbar from its reference image and mount it centred on the roof above the windscreen.",
-  airhorns:
-    "Use the exact airhorns from their reference image and mount them professionally on the roof.",
-  "led-logo":
-    "Use the exact illuminated DAF logo from its reference image and integrate only this logo into the front grille.",
-  sunvisor:
-    "Use the exact sun visor from its reference image and mount it directly above the windscreen.",
-};
+    let parsedAccessories: unknown;
 
-const allAccessoryIds = [
-  "lightbar",
-  "airhorns",
-  "led-logo",
-  "sunvisor",
-];
+    try {
+      parsedAccessories = JSON.parse(accessoriesRaw);
+    } catch {
+      return Response.json(
+        { error: "De accessoireselectie bevat ongeldige JSON." },
+        { status: 400 }
+      );
+    }
 
-const unselectedAccessories = allAccessoryIds.filter(
-  (accessoryId) => !accessories.includes(accessoryId)
-);
+    if (!Array.isArray(parsedAccessories)) {
+      return Response.json(
+        { error: "De accessoireselectie is ongeldig." },
+        { status: 400 }
+      );
+    }
 
-const referenceDescription = accessories
-  .map(
-    (accessory: string, index: number) =>
-      `Image ${index + 2} is the exact reference image for "${accessory}".`
-  )
-  .join("\n");
+    const accessories = parsedAccessories.filter(isAccessoryId);
 
-const selectedInstructions = accessories
-  .map(
-    (accessory: string) =>
-      accessoryInstructions[accessory] ?? `Add only "${accessory}".`
-  )
-  .join("\n");
+    if (accessories.length === 0) {
+      return Response.json(
+        { error: "Selecteer minimaal één geldig accessoire." },
+        { status: 400 }
+      );
+    }
 
-const prompt = `
+    const referenceImages = await Promise.all(
+      accessories.map((accessoryId) =>
+        loadReferenceImage(accessoryId, request.url)
+      )
+    );
+
+    const unselectedAccessories = allowedAccessoryIds.filter(
+      (accessoryId) => !accessories.includes(accessoryId)
+    );
+
+    const referenceDescription = accessories
+      .map(
+        (accessory, index) =>
+          `Image ${index + 2} is the exact reference image for "${accessory}".`
+      )
+      .join("\n");
+
+    const selectedInstructions = accessories
+      .map((accessory) => accessoryInstructions[accessory])
+      .join("\n");
+
+    const prompt = `
 Image 1 is the original truck photograph.
 
 ${referenceDescription}
@@ -100,12 +166,10 @@ Do not add unrelated parts.
 Produce a photorealistic visual impression with exactly the selected edits
 and no other visible modifications.
 `;
+
     const result = await openai.images.edit({
       model: "gpt-image-2",
-      image:
-  referenceImages.length > 0
-    ? [image, ...referenceImages]
-    : image,
+      image: [image, ...referenceImages],
       prompt,
       size: "1536x1024",
       quality: "low",
